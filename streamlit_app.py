@@ -34,6 +34,36 @@ WEEK_DAYS = 5
 def fetch_yahoo_closes(symbols):
     if yf is None:
         raise RuntimeError("yfinance eksik.")
+    # Daha sağlam: auto_adjust, group_by='ticker', progress=False
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.DateOffset(days=200)
+    df = yf.download(
+        symbols,
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        group_by="ticker",
+        progress=False,
+        threads=True,
+    )
+    # Close sütunlarını topla
+    if isinstance(df.columns, pd.MultiIndex):
+        closes = pd.DataFrame({sym: df[sym]["Close"] for sym in df.columns.levels[0] if (sym, "Close") in df.columns})
+    else:
+        closes = df[["Close"]].rename(columns={"Close": symbols[0]}) if "Close" in df.columns else df
+    closes = closes.asfreq("B").ffill().tail(80).iloc[-50:]  # son 50 iş günü, biraz tampon
+    # Tümü NaN veya sabit serileri ele
+    for c in list(closes.columns):
+        s = closes[c]
+        if s.isna().all() or s.nunique(dropna=True) <= 1:
+            closes.drop(columns=[c], inplace=True)
+    if closes.empty:
+        raise RuntimeError("Geçerli kapanış verisi yok (semboller desteklenmiyor veya veri yok)")
+    # Kolon isimleri düzelt
+    if isinstance(closes.columns, pd.MultiIndex):
+        closes.columns = [c[1] if isinstance(c, tuple) else c for c in closes.columns]
+    return closes
     end = pd.Timestamp.today().normalize()
     start = end - pd.DateOffset(days=140)
 
@@ -48,7 +78,16 @@ def fetch_yahoo_closes(symbols):
 # Hesaplayıcılar
 # ----------------------------------------------------
 def compute_returns(closes):
-    return closes.pct_change().dropna()
+    # Log getiri daha stabil; NaN'leri ele
+    logp = np.log(closes.replace(0, np.nan))
+    rets = logp.diff().dropna(how='all')
+    # Veri kalitesi: çok az gözlem veya sıfır varyanslı kolonları at
+    valid_cols = []
+    for c in rets.columns:
+        if rets[c].count() >= 20 and rets[c].std(skipna=True) > 0:
+            valid_cols.append(c)
+    rets = rets[valid_cols]
+    return rets
 
 def momentum_score(closes):
     return closes.iloc[-1] / closes.iloc[0] - 1
@@ -57,7 +96,9 @@ def volatility_score(returns):
     return returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
 
 def expected_annual_returns(returns):
-    mu = returns.mean()
+    # Log-getiri ortalamasını yıllıklaştır
+    mu_daily = returns.mean(skipna=True)
+    return mu_daily * TRADING_DAYS_PER_YEAR
     return (1 + mu) ** TRADING_DAYS_PER_YEAR - 1
 
 def covariance_annual(returns):
@@ -81,27 +122,52 @@ def compute_spread_scores(momentum, sectors):
 # ----------------------------------------------------
 # Optimizasyon (SCS)
 # ----------------------------------------------------
-def optimize_portfolio(mu, cov, allow_short=True):
+def optimize_portfolio(mu, cov, allow_short=True, ridge: float = 1e-8):
     import cvxpy as cp
-    n = len(mu)
-    w = cp.Variable(n)
+    # --- Index hizalama ---
+    tickers = mu.index.intersection(cov.index)
+    mu = mu.loc[tickers].astype(float)
+    cov = cov.loc[tickers, tickers].astype(float).copy()
 
+    # Tek varlık durumu
+    if len(tickers) == 1:
+        w = pd.Series([1.0], index=tickers)
+        pmu = float(mu.iloc[0])
+        psig = float(np.sqrt(max(float(cov.values[0,0]), 0.0)))
+        return w, pmu, psig
+
+    # --- Temizleme ---
+    cov = cov.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    mu = mu.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # --- Sayısal simetrikleştirme + ridge ---
+    P = cov.to_numpy()
+    P = 0.5 * (P + P.T)
+    P = P + np.eye(P.shape[0]) * ridge
+
+    n = len(tickers)
+    w = cp.Variable(n)
     cons = [cp.sum(w) == 1]
     if not allow_short:
         cons.append(w >= 0)
 
-    obj = cp.Minimize(cp.quad_form(w, cov.values))
+    obj = cp.Minimize(cp.quad_form(w, cp.psd_wrap(P)))
     prob = cp.Problem(obj, cons)
     prob.solve(solver=cp.SCS, verbose=False)
 
     if w.value is None:
-        raise RuntimeError("Optimizasyon başarısız.")
+        # ridge'i büyütüp bir kez daha dene
+        P2 = P + np.eye(P.shape[0]) * (10 * ridge)
+        obj2 = cp.Minimize(cp.quad_form(w, cp.psd_wrap(P2)))
+        prob2 = cp.Problem(obj2, cons)
+        prob2.solve(solver=cp.SCS, verbose=False)
+        if w.value is None:
+            raise RuntimeError("Optimizasyon başarısız: Kovaryans/parametreleri kontrol edin.")
 
-    w = pd.Series(w.value, index=mu.index)
-    port_mu = float(mu @ w)
-    port_sigma = float(np.sqrt(w.T @ cov.values @ w))
-
-    return w, port_mu, port_sigma
+    weights = pd.Series(np.array(w.value).flatten(), index=tickers)
+    pmu = float(mu @ weights)
+    psig = float(np.sqrt(weights.T @ P @ weights))
+    return weights, pmu, psig
 
 # ----------------------------------------------------
 # UI
