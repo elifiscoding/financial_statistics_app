@@ -1,246 +1,111 @@
-# streamlit_app.py
 # -*- coding: utf-8 -*-
-"""
-Gelişmiş Streamlit Portföy Optimizasyonu (6 Haftalık Maksimizasyon için)
-✔ Momentum analizi
-✔ Volatilite hedefleme
-✔ Sektör momentumu ısı haritası
-✔ Long/Short spread önerici
-✔ Haftalık performans simülasyonu
-✔ Stop-loss & trailing stop sinyalleri
-✔ Son ekranda "NE ALMALIYIM?" ultra basit öneri
-
-Not: Bu uygulama sadece analiz üretir; emir göndermez.
-"""
-
-from __future__ import annotations
-import numpy as np
 import pandas as pd
+import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-try:
-    import yfinance as yf
-except:
-    yf = None
+
+from app_modules.data import fetch_yahoo_closes, products_supported, sectors_suggested, normalize_symbols_table
+from app_modules.utils import momentum_score, volatility_score, format_pct
+from app_modules.optimize import expected_annual_returns, covariance_annual, optimize_min_variance
+from app_modules.options import option_recommendations_for_universe
 
 TRADING_DAYS_PER_YEAR = 252
 WEEK_DAYS = 5
 
-# ----------------------------------------------------
-# Veri
-# ----------------------------------------------------
-@st.cache_data(show_spinner=False)
-def fetch_yahoo_closes(symbols):
-    if yf is None:
-        raise RuntimeError("yfinance eksik.")
-    end = pd.Timestamp.today().normalize()
-    start = end - pd.DateOffset(days=140)
-
-    df = yf.download(symbols, start=start, end=end)["Close"].asfreq("B").ffill()
-    if isinstance(df, pd.Series):
-        df = df.to_frame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[1] for c in df.columns]
-    return df.iloc[-50:]
-
-# ----------------------------------------------------
-# Hesaplayıcılar
-# ----------------------------------------------------
-def compute_returns(closes):
-    return closes.pct_change().dropna()
-
-def momentum_score(closes):
-    return closes.iloc[-1] / closes.iloc[0] - 1
-
-def volatility_score(returns):
-    return returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR)
-
-def expected_annual_returns(returns):
-    mu = returns.mean()
-    return (1 + mu) ** TRADING_DAYS_PER_YEAR - 1
-
-def covariance_annual(returns):
-    return returns.cov() * TRADING_DAYS_PER_YEAR
-
-# ----------------------------------------------------
-# Long/Short Spread Analizi
-# ----------------------------------------------------
-def compute_spread_scores(momentum, sectors):
-    df = pd.DataFrame({"momentum": momentum, "sector": sectors})
-    scores = {}
-    for s in df["sector"].unique():
-        sec = df[df["sector"] == s]
-        if len(sec) < 2:
-            continue
-        long = sec["momentum"].idxmax()
-        short = sec["momentum"].idxmin()
-        scores[s] = (long, short)
-    return scores
-
-# ----------------------------------------------------
-# Optimizasyon (SCS)
-# ----------------------------------------------------
-def optimize_portfolio(mu, cov, allow_short=True):
-    import cvxpy as cp
-    n = len(mu)
-    w = cp.Variable(n)
-
-    cons = [cp.sum(w) == 1]
-    if not allow_short:
-        cons.append(w >= 0)
-
-    obj = cp.Minimize(cp.quad_form(w, cov.values))
-    prob = cp.Problem(obj, cons)
-    prob.solve(solver=cp.SCS, verbose=False)
-
-    if w.value is None:
-        raise RuntimeError("Optimizasyon başarısız.")
-
-    w = pd.Series(w.value, index=mu.index)
-    port_mu = float(mu @ w)
-    port_sigma = float(np.sqrt(w.T @ cov.values @ w))
-
-    return w, port_mu, port_sigma
-
-# ----------------------------------------------------
-# UI
-# ----------------------------------------------------
 st.set_page_config(layout="wide", page_title="6 Haftalık Portföy Optimizasyonu")
 st.title("📈 6 Haftalık Portföy Maksimizasyonu — Gelişmiş Model")
 st.caption("Yalnızca analiz — emir göndermez.")
 
-# Önerilen sektörler
-sectors_suggested = [
-    "IT", "AI", "Elektrikli Arabalar", "Madencilik", "Sağlık",
-    "Enerji", "Finans", "Tüketim", "Ulaştırma", "Endüstri",
-    "Malzemeler", "Emlak", "İletişim", "Yenilenebilir Enerji",
-    "Yarı İletken", "Biyoteknoloji"
-]
-
-st.subheader("1) Ticker, Ürün ve Sektör Giriniz")
-products_supported = [
-    "FX", "CFDs", "Stocks", "Funds", "ETFs", "Futures", "Listed options", "Bonds", "Mutual funds"
-]
-
+st.subheader("1) Ticker, Ürün, Sektör ve Bütçe")
 default_df = pd.DataFrame({
-    "Ticker": ["AAPL", "NVDA", "TSLA", "EURUSD", "ES"],
-    "Ürün":   ["Stocks", "Stocks", "Stocks", "FX", "Futures"],
-    "Sektör": ["IT", "AI", "Elektrikli Arabalar", "İletişim", "Endüstri"]
+    "Ticker": ["AAPL","NVDA","TSLA","EURUSD","ES"],
+    "Ürün":   ["Stocks","Stocks","Stocks","FX","Futures"],
+    "Sektör": ["IT","AI","Elektrikli Arabalar","İletişim","Endüstri"]
 })
-
 user_df = st.data_editor(
-    default_df,
-    num_rows="dynamic",
-    use_container_width=True,
+    default_df, num_rows="dynamic", use_container_width=True,
     column_config={
         "Ticker": st.column_config.TextColumn("Ticker", help="Örn: AAPL, TSLA, EURUSD, ES, CL"),
-        "Ürün": st.column_config.SelectboxColumn("Ürün", options=products_supported, help="Ekran görüntüsündeki ürün tipleri"),
+        "Ürün":   st.column_config.SelectboxColumn("Ürün", options=products_supported),
         "Sektör": st.column_config.SelectboxColumn("Sektör", options=sectors_suggested)
     }
 )
+budget = st.number_input("Toplam Bütçe (USD)", value=100000, step=1000)
+allow_short = st.checkbox("Short'a izin ver (negatif ağırlık)", value=True)
 
-run = st.button("Hesapla (6 Haftalık Model)")
-
-
-if run:
-    # 1) Girdileri topla ve ürün/ticker normalizasyonu yap
-    def to_yahoo_symbol(ticker: str, product: str) -> tuple[str, str]:
-        t = ticker.upper().replace(" ", "")
-        if product == "FX":
-            # EURUSD -> EURUSD=X
-            if not t.endswith("=X"):
-                t = t + "=X"
-            return t, "OK"
-        if product == "Futures":
-            # ES -> ES=F, CL -> CL=F, GC -> GC=F ...
-            if not t.endswith("=F"):
-                t = t + "=F"
-            return t, "OK"
-        if product in {"Stocks","ETFs","Funds","Mutual funds"}:
-            return t, "OK"
-        if product == "Bonds":
-            return t, "Destek sınırlı: ETF ile analiz (örn. TLT, IEF, HYG)"
-        if product in {"CFDs","Listed options"}:
-            return t, "Doğrudan destek yok: altta yatan ile analiz"
-        return t, "Bilinmeyen ürün"
-
-    rows = []
-    for _, r in user_df.dropna(subset=["Ticker","Ürün"]).iterrows():
-        ysym, note = to_yahoo_symbol(r["Ticker"], r["Ürün"])
-        rows.append({
-            "Girdi": r["Ticker"],
-            "Ürün": r["Ürün"],
-            "Yahoo": ysym,
-            "Durum": note,
-            "Sektör": r.get("Sektör","-")
-        })
-    map_df = pd.DataFrame(rows)
-
+if st.button("Hesapla (6 Haftalık Model)"):
+    # 2) Ürün bazlı sembol eşleştirme ve Yahoo destek kontrolü
+    map_df, supported = normalize_symbols_table(user_df)
     st.subheader("2) Ürün Bazlı Sembol Eşleştirme")
     st.dataframe(map_df, use_container_width=True)
-
-    supported = map_df[map_df["Durum"] == "OK"]["Yahoo"].tolist()
     if not supported:
-        st.error("Desteklenen sembol yok. En az bir 'OK' satırı olmalı.")
+        st.error("Desteklenen sembol yok (OK satırı bulunamadı).")
         st.stop()
-    if len(set(supported)) != len(supported):
-        st.warning("Aynı Yahoo sembolü birden fazla satırda yer alıyor olabilir.")
 
-    # 2) Veri çekimi
+    # 3) Veri -> 50 iş günü kapanış
     closes = fetch_yahoo_closes(supported)
-    returns = compute_returns(closes)
+    returns = closes.pct_change().dropna()
 
-    # (Bundan sonrası mevcut akışın: momentum/vol, spread önerici, optimizasyon, simülasyon, SONUÇ)
-
-
-    # ---------------- Momentum & Vol ----------------
-    st.subheader("2) Momentum ve Volatilite Analizi")
+    st.subheader("3) Momentum ve Volatilite")
     mom = momentum_score(closes)
     vol = volatility_score(returns)
-
-    stats = pd.DataFrame({
-        "Momentum (50g)": mom,
-        "Volatilite": vol
-    })
+    stats = pd.DataFrame({"Momentum (50g)": mom, "Volatilite (yıllık)": vol})
     st.dataframe(stats.style.format("{:.2%}"), use_container_width=True)
+    st.plotly_chart(px.imshow(stats.corr(), text_auto=True, title="Korelasyon (Momentum/Vol)"), use_container_width=True)
 
-    # Isı haritası
-    heat = stats.copy()
-    st.plotly_chart(px.imshow(heat.corr(), text_auto=True, title="Momentum / Volatilite Korelasyon"))
-
-    # ---------------- Long/Short Spread Önerici ----------------
-    st.subheader("3) Long/Short Spread Önerileri")
-    spreads = compute_spread_scores(mom, sector_map)
-
-    for sec, (lng, shrt) in spreads.items():
-        st.write(f"**{sec}**: Long → {lng}, Short → {shrt}")
-
-    # ---------------- Optimizasyon ----------------
-    st.subheader("4) Optimizasyon (Min Varyans)")
+    # 4) Optimizasyon (Min Varyans)
+    st.subheader("4) Optimizasyon")
     mu = expected_annual_returns(returns)
     cov = covariance_annual(returns)
-
-    weights, pmu, psig = optimize_portfolio(mu, cov, allow_short=True)
-
-    st.dataframe(pd.DataFrame({"Ağırlık": weights}).T.T.style.format("{:.2%}"))
+    w, pmu, psig = optimize_min_variance(mu, cov, allow_short=allow_short)
+    weights_df = pd.DataFrame({"Ağırlık": w}).T.T
+    st.dataframe(weights_df.style.format("{:.2%}"), use_container_width=True)
     st.metric("Beklenen Yıllık Getiri", f"{pmu:.2%}")
     st.metric("Yıllık Volatilite", f"{psig:.2%}")
 
-    # ---------------- Haftalık Simülasyon ----------------
-    st.subheader("5) 6 Haftalık Basit Simülasyon")
+    # 5) 6 Haftalık Basit Simülasyon
+    st.subheader("5) 6 Haftalık Beklenen Getiri (Basit)")
     weekly_return_est = pmu / (TRADING_DAYS_PER_YEAR / WEEK_DAYS)
     total_6w = (1 + weekly_return_est) ** 6 - 1
     st.metric("6 Haftalık Beklenen Getiri", f"{total_6w:.2%}")
 
-    # ---------------- Ultra Basit Nihai Öneri ----------------
-    st.subheader("🔥 6) SONUÇ — Ne Almalıyım? (Ultra Basit)")
-    sort_w = weights.sort_values(ascending=False)
+    # 6) Opsiyon Analizi & Enstrüman Önerileri (hisse/ETF için)
+    st.subheader("6) Opsiyon Analizi ve Enstrüman Önerileri")
+    sector_map = {row["Yahoo"]: row["Sektör"] for _, row in map_df[map_df["Durum"]=="OK"].iterrows()}
+    opt_df, recs = option_recommendations_for_universe(
+        underlying_prices=closes.iloc[-1],
+        momentum=mom,
+        budget=budget,
+        horizon_weeks=6
+    )
+    st.dataframe(opt_df, use_container_width=True)
 
-    top3 = sort_w.head(3)
+    # 7) Ultra Basit “NE ALMALIYIM?” — bütçeye göre adet öner
+    st.subheader("🔥 7) SONUÇ — Ne Almalıyım?")
+    # Basit kural: ağırlık * bütçe -> ana enstrüman (hisse/ETF). 
+    # Eğer aynı sembol için opsiyon önerisi 'daha iyi' ise, opsiyon tercih edilir.
+    order_lines = []
+    for sym, weight in w.sort_values(ascending=False).items():
+        if weight <= 0:
+            continue
+        notional = float(budget * max(weight,0))
+        suggestion = recs.get(sym, {})
+        if suggestion.get("prefer") == "option":
+            px_est = suggestion.get("price", np.nan)
+            qty = int(notional // max(px_est,1e-6)) if np.isfinite(px_est) and px_est>0 else 0
+            line = f"- {sym} (OPSİYON {suggestion.get('strategy')}): ~{qty} kontrat (@ ≈ ${px_est:.2f})"
+        else:
+            # Hisse/ETF
+            px = float(closes.iloc[-1][sym])
+            qty = int(notional // px) if px>0 else 0
+            line = f"- {sym}: ~{qty} adet (@ ≈ ${px:.2f})"
+        order_lines.append(line)
+    lines = "\n".join(order_lines[:10])
+    st.success(f"""
+**6 haftalık stratejiye göre ultra basit alış listesi (yaklaşık):**
 
-    st.success(
-    "**6 haftalık stratejiye göre en basit portföy önerisi:**\n"
-    + "\n".join([f"- {i}: %{w*100:.1f}" for i, w in top3.items()])
-    + "\n\nDiğerlerine düşük ağırlık verilebilir veya short pozisyonlarla hedge geçilebilir."
-)
+{lines}
+
+> Not: Bu öneriler yalnızca eğitim amaçlıdır; işlem maliyetleri/döviz etkisi/likidite dikkate alınmamıştır.
+""")
